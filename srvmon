@@ -1,0 +1,160 @@
+#!/usr/bin/perl -w
+# --------------------------------------------------------------------------
+# Description: Script to establish if a service is running on its preferred
+#              instances and will optionally ouput the command required to
+#              relocate the service from the available instances where it is
+#              currently running to the preferred instance(s).
+# --------------------------------------------------------------------------
+#
+# --------------------------------------------------------------------------
+# Change Log:
+# ------------------- ---- -------------------------------------------------
+# Yong Huang           1.0 Initial version
+# Coskan Gundogar      2.0 Modified for 11.2
+# Martin Nash          3.0 Changed to crsctl and runs for all databases on
+#                          the cluster that it is run on.
+# Martin Nash          3.1 Added the option to output commands and code to
+#                          handle instances being down.
+# --------------------------------------------------------------------------
+#
+# --------------------------------------------------------------------------
+# ToDo Section:
+#    + Add option to filter on SERVICE_NAME
+#    + Add code to check for service being disabled and report on this
+#    + Need to exit if srvctl commands return an unrecognised format as this
+#      will generally indicate an error in communication with CRSD
+# --------------------------------------------------------------------------
+
+use strict;
+use Getopt::Std;
+use File::Basename;
+
+my $scriptname = &File::Basename::fileparse($0);
+my $version_no = "3.1";
+
+# Below stops execution when using --help or --version options
+$Getopt::Std::STANDARD_HELP_VERSION = 1;
+
+getopts('cvd:');
+
+our($opt_c, $opt_d, $opt_v);
+
+# Making sure that the database name is lowercase
+$opt_d = lc $opt_d;
+
+$ENV{PATH}="/usr/bin:/bin";
+chomp(my $CRS_HOME = `grep "^+ASM[1-8]" /etc/oratab | cut -d":" -f2`);
+
+# Get all the services that are registered in OCR (filtering on database name if supplied vi -d option)
+$_ = `$CRS_HOME/bin/crsctl stat res -w "TYPE = ora.service.type" | grep NAME= | grep ora.$opt_d | sed 's/NAME=//'`;
+
+# Add all services to @line
+my @line = split /\n/;
+foreach (@line) {
+  my @fields = split /\./;
+  my $db = $fields[1];
+  my $srv = $fields[2];
+  verbose("Examining service $srv in database $db...");
+  # Get PREFERRED and AVAILABLE instances lists
+  $_ = `$CRS_HOME/bin/srvctl config service -d $db -s $srv | egrep "(Available|Preferred) instances" | awk -F": " '{print \$NF}'`;
+  my @srvctl_output = split /\n/; 
+  # PREFFERED is first line
+  my @pref = split (/,/, shift @srvctl_output);
+  # Sorting just in case this isn't guaranteed by srvctl
+  @pref = sort @pref;
+  chomp (my $pref = join(",",@pref));
+  verbose("\tPREFERRED instance(s) list for $srv is: $pref");
+  # AVAILABLE is second line
+  my @avail = ();
+  if (@srvctl_output) { @avail = split (/,/, shift @srvctl_output); }
+  # Sorting just in case this isn't guaranteed by srvctl
+  @avail = sort @avail;
+  chomp (my $avail = join(",",@avail));
+  verbose("\tAVAILABLE instance(s) list for $srv is: $avail");
+  # print "$pref\n"; # DEBUG
+  # Get output of service status command
+  $_ = `$CRS_HOME/bin/srvctl status service -d $db -s $srv`;
+  my @srv_stat = split;
+  my @curr = ();
+  my $curr = "";
+  my $srv_down = "N";
+  if ( $srv_stat[3] eq "not" ) { # Check to see if the service id down
+    $srv_down = "Y";
+    verbose("\tService $srv is DOWN!");
+  } else { # If it's not down then the 7th token is list of instances
+    # Sorting just in case this isn't guaranteed by srvctl
+    @curr = split (/,/, $srv_stat[6]);
+    @curr = sort @curr;
+    chomp ($curr = join(",",@curr));
+    verbose("\tCURRENT instance(s) list for $srv is: $curr");
+  }
+  if ($pref ne $curr) { # If the sorted preferred and current instances don't match
+    verbose("\tPREFERRED and CURRENT instance(s) do not match");
+    if ( $srv_down eq "Y" ) { # If the service is down
+      print "Database: $db Service: $srv has preferred instance(s) $pref and is DOWN!\n";
+	} else {    
+	  print "Database: $db Service: $srv has preferred instance(s) $pref and is running on instance(s) $curr\n";
+    }
+    if ( $opt_c && $opt_c == 1 ) { # If the "-c" option was provided on the command line
+      verbose("\tDisplaying commands as \"-c\" option was supplied on the command line.");
+      # Generate commands to start/relocate the service using srvctl 
+      if ( $srv_down eq "Y" ) { # If the service is down
+        print "  Start $srv using: srvctl start service -d $db -s $srv\n\n";
+	  } 
+	  else {    
+        # Put the current instances into a hash
+	    my %curr_inst = ();
+        foreach (@curr) {
+  	      chomp ($curr = $_);
+          $curr_inst{"$curr"} = 1;
+        }
+        # Initialise hash for recording which of the AVAILABLE instances have been used to relocate from
+        my %used_inst = ();
+        # Iterate through list (@pref), checking hash (%curr_inst) to find preferred instances that are not running
+        foreach (@pref) {
+	      chomp (my $pref = $_);
+	      verbose("\tEvaluating relocation for $srv to $pref - checking status of instance.");
+  	      # Need to check if the instance is actually up
+  	      $_ = `$CRS_HOME/bin/srvctl status instance -d $db -i $pref | awk '{ print \$4 }'`;
+  	      verbose("\tChecking status of instance $pref for $db.");
+  	      if ( /not/ ) { # Instances is down
+	    	  print "  Preferred instance $pref for service $srv in database $db is down, so can't relocate service to it!"
+  	      } else {
+            unless ( $curr_inst{"$pref"} ) { # We've found a preferred instance that is up, but does not have the service on it
+  	          # Now need to find a current instance that is AVAILABLE and output relocation command
+  	          verbose("\tInstance $pref is up - selecting AVAILABLE instance to relocate from.");
+  	          foreach (@avail) {
+  	    	      chomp (my $avail = $_);
+  	    	      # print "$avail\n"; # DEBUG
+  	    	      if ( $curr_inst{"$avail"} ) { 
+  	              print "  Relocate $srv from $curr to $pref using: srvctl relocate service -d $db -s $srv -i $curr -t $pref \n";
+  	              $used_inst{"$curr"} = 1;
+                }  
+              }
+              print "\n";
+            }
+          }
+        }
+      }
+    }
+  }
+  verbose("... Completed examination of service $srv in database $db\n");
+}
+
+sub verbose {
+  if ( $opt_v ) {
+	print "@_\n";
+  }	
+}
+
+sub HELP_MESSAGE {
+print "\nUsage: $scriptname [-d <database name>] [-c] [-v]\n\n" .
+      "Where:" .
+      "\t-d\tAllows specification of a single database to check\n" .
+      "\t-c\tPrints command(s) required to start/relocate services to their preferred instances\n" .
+      "\t-v\tVerbose output so you can see what it's doing\n\n";
+}	
+
+sub VERSION_MESSAGE {
+print "$scriptname - version $version_no\n"
+}	  
